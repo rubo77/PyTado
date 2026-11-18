@@ -323,6 +323,22 @@ class Http:
                     raise TadoException(e) from e
 
         if response.text is None or response.text == "":
+            with open("/tmp/pytado_debug.log", "a") as dbg:
+                dbg.write(f"[PYTADO_EMPTY] {request.action} {url} status={response.status_code} empty response\n")
+                dbg.write(f"[PYTADO_EMPTY] headers={dict(self._session.headers)}\n")
+                dbg.write(f"[PYTADO_EMPTY] resp_headers={dict(response.headers)}\n")
+                dbg.flush()
+            if response.status_code == 429:
+                policy = response.headers.get("RateLimit-Policy", "")
+                limit = response.headers.get("RateLimit", "")
+                self._rate_limit = {
+                    "per-day": policy.split(";q=")[1].split(";")[0] if ";q=" in policy else "",
+                    "window-seconds": policy.split(";w=")[1] if ";w=" in policy else "",
+                    "remaining": limit.split(";r=")[1].split(";")[0] if ";r=" in limit else "0",
+                }
+                raise requests.exceptions.HTTPError(
+                    f"Tado API rate limit reached ({limit})", response=response
+                )
             return {}
 
         # Retrieve the headers to update the rate limit info
@@ -338,6 +354,10 @@ class Http:
                 "remaining": rate_limit.split(";")[1].split("=")[1],
             }
 
+        with open("/tmp/pytado_debug.log", "a") as dbg:
+            dbg.write(f"[PYTADO_REQUEST] {request.action} {url} status={response.status_code} body={str(response.text)[:500]}\n")
+            dbg.write(f"[PYTADO_REQUEST] headers={dict(self._session.headers)}\n")
+            dbg.flush()
         return response.json()
 
     def _configure_url(self, request: TadoRequest) -> str:
@@ -583,11 +603,13 @@ class Http:
         while True:
             if self._check_device_activation():
                 break
+            time.sleep(5)
 
         self._device_ready()
 
     def _device_ready(self):
         """after device refresh code has been obtained"""
+        _LOGGER.warning("[PYTADO_READY] device_ready called, headers: %s", {k: v[:20] if isinstance(v, str) else v for k, v in self._session.headers.items()})
         self._id = self._get_id()
         self._x_api = self._check_x_line_generation()
         self._user_code = None
@@ -599,9 +621,19 @@ class Http:
         request.action = Action.GET
         request.domain = Domain.ME
 
-        homes_ = self.request(request)["homes"]
+        response = self.request(request)
+        with open("/tmp/pytado_debug.log", "a") as dbg:
+            dbg.write(f"[PYTADO_GET_ID] response type={type(response).__name__} content={str(response)[:500]}\n")
+            dbg.flush()
+        if isinstance(response, dict) and "homes" in response:
+            homes_ = response["homes"]
+        elif isinstance(response, list):
+            homes_ = response
+        else:
+            _LOGGER.error("[PYTADO_GET_ID] Unexpected response format: %s", type(response))
+            raise TadoException(f"Unexpected response from /me endpoint: {response}")
 
-        return homes_[0]["id"]
+        return int(homes_[0]["id"])
 
     def _check_x_line_generation(self):
         # get home info
